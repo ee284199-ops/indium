@@ -38,37 +38,42 @@ Indium::PrivateRenderCommandEncoder::PrivateRenderCommandEncoder(std::shared_ptr
 	}
 
 	auto firstTexture = descriptor.colorAttachments.front().texture;
-	std::vector<VkClearValue> clearValues;
-
-	for (const auto& color: descriptor.colorAttachments) {
-		auto clearColor = color.clearColor;
-		VkClearValue clearValue {};
-		clearValue.color.float32[0] = clearColor.red;
-		clearValue.color.float32[1] = clearColor.green;
-		clearValue.color.float32[2] = clearColor.blue;
-		clearValue.color.float32[3] = clearColor.alpha;
-		clearValues.push_back(clearValue);
-
-		// TODO: distinguish between read-only and read-write textures
-		_readWriteTextures.push_back(color.texture);
-	}
-
-	if (descriptor.depthAttachment || descriptor.stencilAttachment) {
-		VkClearValue clearValue {};
-		clearValue.depthStencil.depth = descriptor.depthAttachment ? descriptor.depthAttachment->clearDepth : 1.0;
-		clearValue.depthStencil.stencil = descriptor.stencilAttachment ? descriptor.stencilAttachment->clearStencil : 0;
-		clearValues.push_back(clearValue);
-	}
 
 	std::vector<VkAttachmentDescription> renderPassAttachments;
+	std::vector<VkAttachmentReference> colorAttachmentRefs;
+	std::vector<VkAttachmentReference> resolveAttachmentRefs;
+	bool hasResolveAttachments = false;
+	VkAttachmentReference depthStencilAttachmentRef {};
+	bool hasDepthStencilAttachment = false;
+	std::vector<VkClearValue> clearValues;
+	std::vector<VkImageView> framebufferAttachments;
 	std::vector<VkSubpassDescription> subpasses;
 	std::vector<VkSubpassDependency> dependencies;
 
+	// the command buffer creates presentation semaphores and calls precommit() for every
+	// texture in this list, so every attachment we write to (including resolve targets and
+	// depth/stencil textures) has to be in it. don't add the same texture twice, though:
+	// commit() locks a non-recursive mutex for each entry.
+	auto addReadWriteTexture = [this](const std::shared_ptr<Texture>& texture) {
+		if (!texture) {
+			return;
+		}
+
+		for (const auto& existing: _readWriteTextures) {
+			if (existing == texture) {
+				return;
+			}
+		}
+
+		_readWriteTextures.push_back(texture);
+	};
+
 	for (const auto& color: descriptor.colorAttachments) {
 		auto privateTexture = std::dynamic_pointer_cast<PrivateTexture>(color.texture);
+
 		VkAttachmentDescription desc {};
 		desc.format = pixelFormatToVkFormat(color.texture->pixelFormat());
-		desc.samples = VK_SAMPLE_COUNT_1_BIT; // TODO: support multisampling
+		desc.samples = sampleCountToVkSampleCountFlagBits(privateTexture->sampleCount());
 		desc.loadOp = loadActionToVkAttachmentLoadOp(color.loadAction, true);
 		desc.storeOp = storeActionToVkAttachmentStoreOp(color.storeAction, true);
 		desc.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
@@ -76,49 +81,117 @@ Indium::PrivateRenderCommandEncoder::PrivateRenderCommandEncoder(std::shared_ptr
 		desc.initialLayout = (color.loadAction == LoadAction::Load) ? privateTexture->imageLayout() : VK_IMAGE_LAYOUT_UNDEFINED;
 		desc.finalLayout = privateTexture->imageLayout();
 		renderPassAttachments.push_back(desc);
-	}
 
-	if (descriptor.depthAttachment) {
-		auto privateTexture = std::dynamic_pointer_cast<PrivateTexture>(descriptor.depthAttachment->texture);
-		VkAttachmentDescription desc {};
-		desc.format = pixelFormatToVkFormat(privateTexture->pixelFormat());
-		desc.samples = VK_SAMPLE_COUNT_1_BIT;
-		desc.loadOp = loadActionToVkAttachmentLoadOp(descriptor.depthAttachment->loadAction, false);
-		desc.storeOp = storeActionToVkAttachmentStoreOp(descriptor.depthAttachment->storeAction, false);
-		desc.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-		desc.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-		desc.initialLayout = (descriptor.depthAttachment->loadAction == LoadAction::Load) ? privateTexture->imageLayout() : VK_IMAGE_LAYOUT_UNDEFINED;
-		desc.finalLayout = privateTexture->imageLayout();
-		renderPassAttachments.push_back(desc);
-	}
-
-	if (descriptor.stencilAttachment) {
-		throw std::runtime_error("TODO: support stencil attachments");
-	}
-
-	std::vector<VkAttachmentReference> colorAttachments;
-	VkAttachmentReference depthStencilAttachment {};
-
-	size_t index = 0;
-	for (const auto& color: descriptor.colorAttachments) {
 		VkAttachmentReference ref {};
-		ref.attachment = index;
+		ref.attachment = renderPassAttachments.size() - 1;
 		ref.layout = VK_IMAGE_LAYOUT_GENERAL;
-		colorAttachments.push_back(ref);
-		++index;
+		colorAttachmentRefs.push_back(ref);
+
+		VkClearValue clearValue {};
+		clearValue.color.float32[0] = color.clearColor.red;
+		clearValue.color.float32[1] = color.clearColor.green;
+		clearValue.color.float32[2] = color.clearColor.blue;
+		clearValue.color.float32[3] = color.clearColor.alpha;
+		clearValues.push_back(clearValue);
+
+		framebufferAttachments.push_back(privateTexture->imageView());
+
+		addReadWriteTexture(color.texture);
 	}
 
-	if (descriptor.depthAttachment) {
-		depthStencilAttachment.attachment = index;
-		depthStencilAttachment.layout = VK_IMAGE_LAYOUT_GENERAL;
-		++index;
+	// resolve targets go right after the color attachments, in the same order.
+	for (const auto& color: descriptor.colorAttachments) {
+		bool resolves = color.resolveTexture && (color.storeAction == StoreAction::MultisampleResolve || color.storeAction == StoreAction::StoreAndMultisampleResolve);
+
+		VkAttachmentReference ref {};
+		if (resolves) {
+			auto privateResolveTexture = std::dynamic_pointer_cast<PrivateTexture>(color.resolveTexture);
+			hasResolveAttachments = true;
+
+			VkAttachmentDescription desc {};
+			desc.format = pixelFormatToVkFormat(color.resolveTexture->pixelFormat());
+			desc.samples = VK_SAMPLE_COUNT_1_BIT;
+			desc.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+			desc.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+			desc.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+			desc.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+			desc.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+			desc.finalLayout = privateResolveTexture->imageLayout();
+			// TODO: honor color.resolveLevel and color.resolveSlice; the image views we create
+			//       cover every mip and layer, so we can't select a single one here.
+			renderPassAttachments.push_back(desc);
+
+			ref.attachment = renderPassAttachments.size() - 1;
+			ref.layout = VK_IMAGE_LAYOUT_GENERAL;
+
+			VkClearValue clearValue {};
+			clearValues.push_back(clearValue);
+
+			framebufferAttachments.push_back(privateResolveTexture->imageView());
+
+			addReadWriteTexture(color.resolveTexture);
+		} else {
+			ref.attachment = VK_ATTACHMENT_UNUSED;
+			ref.layout = VK_IMAGE_LAYOUT_UNDEFINED;
+		}
+		resolveAttachmentRefs.push_back(ref);
+	}
+
+	if (descriptor.depthAttachment || descriptor.stencilAttachment) {
+		bool hasDepth = static_cast<bool>(descriptor.depthAttachment);
+		bool hasStencil = static_cast<bool>(descriptor.stencilAttachment);
+		bool combined = hasDepth && hasStencil && descriptor.depthAttachment->texture == descriptor.stencilAttachment->texture;
+
+		if (hasDepth && hasStencil && !combined) {
+			throw std::runtime_error("TODO: support separate depth and stencil attachments");
+		}
+
+		// a stencil-only attachment still has to be exposed as a depth/stencil attachment
+		auto dsTexture = hasDepth ? descriptor.depthAttachment->texture : descriptor.stencilAttachment->texture;
+		auto privateDsTexture = std::dynamic_pointer_cast<PrivateTexture>(dsTexture);
+
+		VkAttachmentDescription desc {};
+		desc.format = pixelFormatToVkFormat(dsTexture->pixelFormat());
+		desc.samples = sampleCountToVkSampleCountFlagBits(privateDsTexture->sampleCount());
+		if (hasDepth) {
+			desc.loadOp = loadActionToVkAttachmentLoadOp(descriptor.depthAttachment->loadAction, false);
+			desc.storeOp = storeActionToVkAttachmentStoreOp(descriptor.depthAttachment->storeAction, false);
+		} else {
+			desc.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+			desc.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+		}
+		if (hasStencil) {
+			desc.stencilLoadOp = loadActionToVkAttachmentLoadOp(descriptor.stencilAttachment->loadAction, false);
+			desc.stencilStoreOp = storeActionToVkAttachmentStoreOp(descriptor.stencilAttachment->storeAction, false);
+		} else {
+			desc.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+			desc.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+		}
+		bool load = (hasDepth && descriptor.depthAttachment->loadAction == LoadAction::Load) || (hasStencil && descriptor.stencilAttachment->loadAction == LoadAction::Load);
+		desc.initialLayout = load ? privateDsTexture->imageLayout() : VK_IMAGE_LAYOUT_UNDEFINED;
+		desc.finalLayout = privateDsTexture->imageLayout();
+		renderPassAttachments.push_back(desc);
+
+		depthStencilAttachmentRef.attachment = renderPassAttachments.size() - 1;
+		depthStencilAttachmentRef.layout = VK_IMAGE_LAYOUT_GENERAL;
+		hasDepthStencilAttachment = true;
+
+		VkClearValue clearValue {};
+		clearValue.depthStencil.depth = hasDepth ? descriptor.depthAttachment->clearDepth : 1.0;
+		clearValue.depthStencil.stencil = hasStencil ? descriptor.stencilAttachment->clearStencil : 0;
+		clearValues.push_back(clearValue);
+
+		framebufferAttachments.push_back(privateDsTexture->imageView());
+
+		addReadWriteTexture(dsTexture);
 	}
 
 	auto& subpassDesc = subpasses.emplace_back();
 	subpassDesc.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
-	subpassDesc.colorAttachmentCount = colorAttachments.size();
-	subpassDesc.pColorAttachments = colorAttachments.data();
-	subpassDesc.pDepthStencilAttachment = (descriptor.depthAttachment || descriptor.stencilAttachment) ? &depthStencilAttachment : nullptr;
+	subpassDesc.colorAttachmentCount = colorAttachmentRefs.size();
+	subpassDesc.pColorAttachments = colorAttachmentRefs.data();
+	subpassDesc.pResolveAttachments = hasResolveAttachments ? resolveAttachmentRefs.data() : nullptr;
+	subpassDesc.pDepthStencilAttachment = hasDepthStencilAttachment ? &depthStencilAttachmentRef : nullptr;
 
 	VkRenderPassCreateInfo renderPassInfo {};
 	renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
@@ -132,16 +205,6 @@ Indium::PrivateRenderCommandEncoder::PrivateRenderCommandEncoder(std::shared_ptr
 	if (DynamicVK::vkCreateRenderPass(vkDevice, &renderPassInfo, nullptr, &_renderPass) != VK_SUCCESS) {
 		// TODO
 		abort();
-	}
-
-	std::vector<VkImageView> framebufferAttachments;
-
-	for (const auto& colorAttachment: descriptor.colorAttachments) {
-		framebufferAttachments.push_back(std::dynamic_pointer_cast<PrivateTexture>(colorAttachment.texture)->imageView());
-	}
-
-	if (descriptor.depthAttachment) {
-		framebufferAttachments.push_back(std::dynamic_pointer_cast<PrivateTexture>(descriptor.depthAttachment->texture)->imageView());
 	}
 
 	VkFramebufferCreateInfo framebufferInfo {};
@@ -181,6 +244,10 @@ Indium::PrivateRenderCommandEncoder::PrivateRenderCommandEncoder(std::shared_ptr
 	DynamicVK::vkCmdSetDepthBoundsTestEnable(vkCmdBuf, false);
 
 	DynamicVK::vkCmdSetStencilTestEnable(vkCmdBuf, false);
+	DynamicVK::vkCmdSetStencilCompareMask(vkCmdBuf, VK_STENCIL_FACE_FRONT_AND_BACK, UINT32_MAX);
+	DynamicVK::vkCmdSetStencilWriteMask(vkCmdBuf, VK_STENCIL_FACE_FRONT_AND_BACK, UINT32_MAX);
+	DynamicVK::vkCmdSetStencilOp(vkCmdBuf, VK_STENCIL_FACE_FRONT_AND_BACK, VK_STENCIL_OP_KEEP, VK_STENCIL_OP_KEEP, VK_STENCIL_OP_KEEP, VK_COMPARE_OP_ALWAYS);
+	DynamicVK::vkCmdSetStencilReference(vkCmdBuf, VK_STENCIL_FACE_FRONT_AND_BACK, 0);
 
 	setBlendColor(0, 0, 0, 0);
 	DynamicVK::vkCmdSetRasterizerDiscardEnable(vkCmdBuf, false);
@@ -520,56 +587,50 @@ void Indium::PrivateRenderCommandEncoder::drawIndexedPrimitives(PrimitiveType pr
 
 void Indium::PrivateRenderCommandEncoder::setDepthStencilState(std::shared_ptr<DepthStencilState> state) {
 	auto buf = _privateCommandBuffer.lock();
+	auto vkCmdBuf = buf->commandBuffer();
 	auto privateState = std::dynamic_pointer_cast<PrivateDepthStencilState>(state);
 
 	if (!privateState) {
 		// like Metal, no state means the defaults: no depth or stencil testing
-		DynamicVK::vkCmdSetDepthTestEnable(buf->commandBuffer(), VK_FALSE);
-		DynamicVK::vkCmdSetDepthWriteEnable(buf->commandBuffer(), VK_FALSE);
-		DynamicVK::vkCmdSetStencilTestEnable(buf->commandBuffer(), VK_FALSE);
+		DynamicVK::vkCmdSetDepthTestEnable(vkCmdBuf, VK_FALSE);
+		DynamicVK::vkCmdSetDepthWriteEnable(vkCmdBuf, VK_FALSE);
+		DynamicVK::vkCmdSetStencilTestEnable(vkCmdBuf, VK_FALSE);
+		DynamicVK::vkCmdSetStencilReference(vkCmdBuf, VK_STENCIL_FACE_FRONT_AND_BACK, 0);
 		return;
 	}
 
 	auto& desc = privateState->descriptor();
 
-	DynamicVK::vkCmdSetDepthWriteEnable(buf->commandBuffer(), desc.depthWriteEnabled ? VK_TRUE : VK_FALSE);
-	DynamicVK::vkCmdSetDepthCompareOp(buf->commandBuffer(), compareFunctionToVkCompareOp(desc.depthCompareFunction));
-	DynamicVK::vkCmdSetDepthTestEnable(buf->commandBuffer(), VK_TRUE);
+	DynamicVK::vkCmdSetDepthWriteEnable(vkCmdBuf, desc.depthWriteEnabled ? VK_TRUE : VK_FALSE);
+	DynamicVK::vkCmdSetDepthCompareOp(vkCmdBuf, compareFunctionToVkCompareOp(desc.depthCompareFunction));
+	DynamicVK::vkCmdSetDepthTestEnable(vkCmdBuf, VK_TRUE);
 
-	DynamicVK::vkCmdSetStencilTestEnable(buf->commandBuffer(), (desc.frontFaceStencil || desc.backFaceStencil) ? VK_TRUE : VK_FALSE);
+	DynamicVK::vkCmdSetStencilTestEnable(vkCmdBuf, (desc.frontFaceStencil || desc.backFaceStencil) ? VK_TRUE : VK_FALSE);
 
-	if (desc.frontFaceStencil || desc.backFaceStencil) {
-		if (desc.frontFaceStencil) {
-			DynamicVK::vkCmdSetStencilCompareMask(buf->commandBuffer(), VK_STENCIL_FACE_FRONT_BIT, desc.frontFaceStencil->readMask);
-			DynamicVK::vkCmdSetStencilWriteMask(buf->commandBuffer(), VK_STENCIL_FACE_FRONT_BIT, desc.frontFaceStencil->writeMask);
-
-			DynamicVK::vkCmdSetStencilOp(
-				buf->commandBuffer(),
-				VK_STENCIL_FACE_FRONT_BIT,
-				stencilOperationToVkStencilOp(desc.frontFaceStencil->stencilFailureOperation),
-				stencilOperationToVkStencilOp(desc.frontFaceStencil->depthStencilPassOperation),
-				stencilOperationToVkStencilOp(desc.frontFaceStencil->depthFailureOperation),
-				compareFunctionToVkCompareOp(desc.frontFaceStencil->stencilCompareFunction)
-			);
-		} else {
-			DynamicVK::vkCmdSetStencilOp(buf->commandBuffer(), VK_STENCIL_FACE_FRONT_BIT, VK_STENCIL_OP_KEEP, VK_STENCIL_OP_KEEP, VK_STENCIL_OP_KEEP, VK_COMPARE_OP_ALWAYS);
-		}
-		if (desc.backFaceStencil) {
-			DynamicVK::vkCmdSetStencilCompareMask(buf->commandBuffer(), VK_STENCIL_FACE_BACK_BIT, desc.backFaceStencil->readMask);
-			DynamicVK::vkCmdSetStencilWriteMask(buf->commandBuffer(), VK_STENCIL_FACE_BACK_BIT, desc.backFaceStencil->writeMask);
+	// all of the stencil states are dynamic, so we have to set them for both faces
+	// whether or not the corresponding descriptor was provided.
+	const auto applyStencil = [&](VkStencilFaceFlags face, const std::optional<StencilDescriptor>& stencil) {
+		if (stencil) {
+			DynamicVK::vkCmdSetStencilCompareMask(vkCmdBuf, face, stencil->readMask);
+			DynamicVK::vkCmdSetStencilWriteMask(vkCmdBuf, face, stencil->writeMask);
 
 			DynamicVK::vkCmdSetStencilOp(
-				buf->commandBuffer(),
-				VK_STENCIL_FACE_BACK_BIT,
-				stencilOperationToVkStencilOp(desc.backFaceStencil->stencilFailureOperation),
-				stencilOperationToVkStencilOp(desc.backFaceStencil->depthStencilPassOperation),
-				stencilOperationToVkStencilOp(desc.backFaceStencil->depthFailureOperation),
-				compareFunctionToVkCompareOp(desc.backFaceStencil->stencilCompareFunction)
+				vkCmdBuf,
+				face,
+				stencilOperationToVkStencilOp(stencil->stencilFailureOperation),
+				stencilOperationToVkStencilOp(stencil->depthStencilPassOperation),
+				stencilOperationToVkStencilOp(stencil->depthFailureOperation),
+				compareFunctionToVkCompareOp(stencil->stencilCompareFunction)
 			);
 		} else {
-			DynamicVK::vkCmdSetStencilOp(buf->commandBuffer(), VK_STENCIL_FACE_BACK_BIT, VK_STENCIL_OP_KEEP, VK_STENCIL_OP_KEEP, VK_STENCIL_OP_KEEP, VK_COMPARE_OP_ALWAYS);
+			DynamicVK::vkCmdSetStencilCompareMask(vkCmdBuf, face, UINT32_MAX);
+			DynamicVK::vkCmdSetStencilWriteMask(vkCmdBuf, face, UINT32_MAX);
+			DynamicVK::vkCmdSetStencilOp(vkCmdBuf, face, VK_STENCIL_OP_KEEP, VK_STENCIL_OP_KEEP, VK_STENCIL_OP_KEEP, VK_COMPARE_OP_ALWAYS);
 		}
-	}
+	};
+
+	applyStencil(VK_STENCIL_FACE_FRONT_BIT, desc.frontFaceStencil);
+	applyStencil(VK_STENCIL_FACE_BACK_BIT, desc.backFaceStencil);
 };
 
 void Indium::PrivateRenderCommandEncoder::setTriangleFillMode(TriangleFillMode triangleFillMode) {

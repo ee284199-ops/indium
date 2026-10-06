@@ -439,9 +439,7 @@ Indium::ConcreteTexture::ConcreteTexture(std::shared_ptr<PrivateDevice> device, 
 	info.extent.depth = _descriptor.depth;
 	info.mipLevels = _descriptor.mipmapLevelCount;
 	info.arrayLayers = _descriptor.arrayLength * (isCube ? 6 : 1);
-	// TODO
-	//info.samples = _descriptor.sampleCount;
-	info.samples = VK_SAMPLE_COUNT_1_BIT;
+	info.samples = sampleCountToVkSampleCountFlagBits(_descriptor.sampleCount ? _descriptor.sampleCount : 1);
 
 	if (_descriptor.textureType == TextureType::eCube || _descriptor.textureType == TextureType::eCubeArray) {
 		info.flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
@@ -457,6 +455,9 @@ Indium::ConcreteTexture::ConcreteTexture(std::shared_ptr<PrivateDevice> device, 
 		// depth-stencil formats don't seem to work with VK_IMAGE_TILING_LINEAR, so we force OPTIMAL instead
 		isDepthStencil ||
 
+		// multisampled images can't use VK_IMAGE_TILING_LINEAR either
+		_descriptor.sampleCount > 1 ||
+
 		// linear textures only support a single mip level
 		_descriptor.mipmapLevelCount > 1
 	) {
@@ -466,7 +467,11 @@ Indium::ConcreteTexture::ConcreteTexture(std::shared_ptr<PrivateDevice> device, 
 	info.tiling = (descriptor.allowGPUOptimizedContents || !canBeLinear) ? VK_IMAGE_TILING_OPTIMAL : VK_IMAGE_TILING_LINEAR;
 
 	// we don't know ahead of time how the image is going to be used, so specify everything we support
-	info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+	info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+	// multisampled images can't be used as storage images
+	if (_descriptor.sampleCount <= 1) {
+		info.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+	}
 	if (isColor) {
 		info.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
 	} else if (isDepthStencil) {

@@ -20,6 +20,9 @@ namespace Indium {
 			std::shared_ptr<PrivateFunction> _vertexFunction;
 			std::shared_ptr<PrivateFunction> _fragmentFunction;
 			std::optional<VertexDescriptor> _vertexDescriptor;
+			size_t _rasterSampleCount = 1;
+			bool _alphaToCoverageEnabled = false;
+			bool _alphaToOneEnabled = false;
 
 		public:
 			PrivateRenderPipelineState(std::shared_ptr<PrivateDevice> device, const RenderPipelineDescriptor& descriptor);
