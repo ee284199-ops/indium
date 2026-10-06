@@ -72,6 +72,7 @@ namespace Iridium {
 			_macro(LLVMDisposeMessage) \
 			_macro(LLVMDisposeModule) \
 			_macro(LLVMGetAlignment) \
+			_macro(LLVMGetAllocatedType) \
 			_macro(LLVMGetArrayLength) \
 			_macro(LLVMGetCalledValue) \
 			_macro(LLVMGetCondition) \
@@ -82,6 +83,8 @@ namespace Iridium {
 			_macro(LLVMGetFirstBasicBlock) \
 			_macro(LLVMGetFirstInstruction) \
 			_macro(LLVMGetFirstNamedMetadata) \
+			_macro(LLVMGetFirstUse) \
+			_macro(LLVMGetGEPSourceElementType) \
 			_macro(LLVMGetIncomingBlock) \
 			_macro(LLVMGetIncomingValue) \
 			_macro(LLVMGetIndices) \
@@ -99,6 +102,7 @@ namespace Iridium {
 			_macro(LLVMGetNamedMetadataOperands) \
 			_macro(LLVMGetNextBasicBlock) \
 			_macro(LLVMGetNextInstruction) \
+			_macro(LLVMGetNextUse) \
 			_macro(LLVMGetNumContainedTypes) \
 			_macro(LLVMGetNumIndices) \
 			_macro(LLVMGetNumMaskElements) \
@@ -109,12 +113,24 @@ namespace Iridium {
 			_macro(LLVMGetPointerAddressSpace) \
 			_macro(LLVMGetReturnType) \
 			_macro(LLVMGetSuccessor) \
+			_macro(LLVMGetTypeContext) \
 			_macro(LLVMGetTypeKind) \
 			_macro(LLVMGetUndefMaskElem) \
+			_macro(LLVMGetUser) \
 			_macro(LLVMGetValueKind) \
 			_macro(LLVMGetValueName2) \
 			_macro(LLVMGetVectorSize) \
+			_macro(LLVMGlobalGetValueType) \
+			_macro(LLVMInt32TypeInContext) \
+			_macro(LLVMIsAAllocaInst) \
+			_macro(LLVMIsAConstantExpr) \
+			_macro(LLVMIsAGetElementPtrInst) \
+			_macro(LLVMIsAGlobalValue) \
+			_macro(LLVMIsALoadInst) \
 			_macro(LLVMIsAMDString) \
+			_macro(LLVMIsAPHINode) \
+			_macro(LLVMIsASelectInst) \
+			_macro(LLVMIsAStoreInst) \
 			_macro(LLVMIsConditional) \
 			_macro(LLVMIsPackedStruct) \
 			_macro(LLVMParseBitcode2) \
@@ -126,5 +142,9 @@ namespace Iridium {
 			extern DynamicFunction<decltype(_name)> _name;
 
 		IRIDIUM_DYNAMICLLVM_FUNCTION_FOREACH(IRIDIUM_DYNAMICLLVM_FUNCTION_DECL)
+
+		// Only exists since LLVM 15 (older versions have typed pointers only), so it's declared by hand
+		// instead of with decltype() and has to be checked with isAvailable() before use.
+		extern DynamicFunction<LLVMBool(LLVMTypeRef)> LLVMPointerTypeIsOpaque;
 	};
 };

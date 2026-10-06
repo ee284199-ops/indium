@@ -12,6 +12,8 @@ static void* libraryHandle = NULL;
 
 IRIDIUM_DYNAMICLLVM_FUNCTION_FOREACH(DYNAMICLLVM_FUNCTION_DEF)
 
+Iridium::DynamicLLVM::DynamicFunction<LLVMBool(LLVMTypeRef)> Iridium::DynamicLLVM::LLVMPointerTypeIsOpaque("LLVMPointerTypeIsOpaque");
+
 bool Iridium::DynamicLLVM::init() {
 #ifdef DARLING
 	libraryHandle = _elfcalls->dlopen(HOST_LLVM_LIBNAME);

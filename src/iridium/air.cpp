@@ -5,6 +5,8 @@
 
 #include <llvm-c/BitReader.h>
 
+#include <unordered_set>
+
 namespace DynamicLLVM = Iridium::DynamicLLVM;
 
 // special thanks to https://github.com/YuAo/MetalLibraryArchive for information on the library format
@@ -42,6 +44,109 @@ Iridium::AIR::Function::Function(Type type, const std::string& name, const void*
 #include <iostream>
 
 class ImpossibleResultID: public std::exception {};
+
+//
+// pointee types
+//
+// SPIR-V pointers need to know what they point to. With typed pointers, that's just the element type of
+// the LLVM pointer type, but opaque pointers (the default since LLVM 15 and the only kind since LLVM 17)
+// don't carry it, even when the bitcode itself was written with typed pointers. In that case, recover it
+// from how the pointer is produced or used.
+//
+
+static bool isOpaquePointerType(LLVMTypeRef type) {
+	// LLVMPointerTypeIsOpaque only exists since LLVM 15; before that, all pointers were typed
+	return DynamicLLVM::LLVMPointerTypeIsOpaque.isAvailable() && DynamicLLVM::LLVMPointerTypeIsOpaque(type);
+};
+
+// the type of the element that a GEP (instruction or constant expression) produces a pointer to
+static LLVMTypeRef gepResultElementType(LLVMValueRef gep) {
+	auto type = DynamicLLVM::LLVMGetGEPSourceElementType(gep);
+	auto operandCount = DynamicLLVM::LLVMGetNumOperands(gep);
+
+	// operand 0 is the base pointer and operand 1 only steps over whole elements;
+	// each further index selects a member or element of the current type
+	for (int i = 2; i < operandCount; ++i) {
+		switch (DynamicLLVM::LLVMGetTypeKind(type)) {
+			case LLVMStructTypeKind:
+				type = DynamicLLVM::LLVMStructGetTypeAtIndex(type, DynamicLLVM::LLVMConstIntGetZExtValue(DynamicLLVM::LLVMGetOperand(gep, i)));
+				break;
+
+			case LLVMArrayTypeKind:
+			case LLVMVectorTypeKind:
+				type = DynamicLLVM::LLVMGetElementType(type);
+				break;
+
+			default:
+				throw std::runtime_error("GEP indexes into a type that isn't an aggregate");
+		}
+	}
+
+	return type;
+};
+
+// Works out what a pointer points to from its uses: preferably the source element type of a GEP based on
+// it (which describes whole structures or array elements), otherwise the type loaded through or stored to it.
+static LLVMTypeRef inferPointeeTypeFromUses(LLVMValueRef ptr, std::unordered_set<LLVMValueRef>& visited) {
+	if (!visited.insert(ptr).second) {
+		return nullptr;
+	}
+
+	LLVMTypeRef accessedType = nullptr;
+
+	for (auto use = DynamicLLVM::LLVMGetFirstUse(ptr); use != nullptr; use = DynamicLLVM::LLVMGetNextUse(use)) {
+		auto user = DynamicLLVM::LLVMGetUser(use);
+
+		if (DynamicLLVM::LLVMIsAGetElementPtrInst(user) && DynamicLLVM::LLVMGetOperand(user, 0) == ptr) {
+			return DynamicLLVM::LLVMGetGEPSourceElementType(user);
+		} else if (DynamicLLVM::LLVMIsALoadInst(user)) {
+			if (!accessedType) {
+				accessedType = DynamicLLVM::LLVMTypeOf(user);
+			}
+		} else if (DynamicLLVM::LLVMIsAStoreInst(user) && DynamicLLVM::LLVMGetOperand(user, 1) == ptr) {
+			if (!accessedType) {
+				accessedType = DynamicLLVM::LLVMTypeOf(DynamicLLVM::LLVMGetOperand(user, 0));
+			}
+		} else if (DynamicLLVM::LLVMIsAPHINode(user) || DynamicLLVM::LLVMIsASelectInst(user)) {
+			// the pointer flows into another one, which points to the same thing
+			if (auto inferred = inferPointeeTypeFromUses(user, visited)) {
+				return inferred;
+			}
+		}
+	}
+
+	return accessedType;
+};
+
+static LLVMTypeRef pointeeTypeOf(LLVMValueRef ptr) {
+	auto type = DynamicLLVM::LLVMTypeOf(ptr);
+
+	if (!isOpaquePointerType(type)) {
+		return DynamicLLVM::LLVMGetElementType(type);
+	}
+
+	if (DynamicLLVM::LLVMIsAGetElementPtrInst(ptr) || (DynamicLLVM::LLVMIsAConstantExpr(ptr) && DynamicLLVM::LLVMGetConstOpcode(ptr) == LLVMGetElementPtr)) {
+		return gepResultElementType(ptr);
+	}
+
+	if (DynamicLLVM::LLVMIsAAllocaInst(ptr)) {
+		return DynamicLLVM::LLVMGetAllocatedType(ptr);
+	}
+
+	if (DynamicLLVM::LLVMIsAGlobalValue(ptr)) {
+		return DynamicLLVM::LLVMGlobalGetValueType(ptr);
+	}
+
+	std::unordered_set<LLVMValueRef> visited;
+	if (auto inferred = inferPointeeTypeFromUses(ptr, visited)) {
+		return inferred;
+	}
+
+	// Nothing says what it points to, e.g. a buffer argument the function never touches (only its address
+	// gets passed around then). Use a 32-bit integer rather than a byte, since 8-bit integers would need
+	// an extra capability that not every device has.
+	return DynamicLLVM::LLVMInt32TypeInContext(DynamicLLVM::LLVMGetTypeContext(type));
+};
 
 static Iridium::SPIRV::ResultID llvmTypeToSPIRVType(Iridium::SPIRV::Builder& builder, LLVMTypeRef llvmType) {
 	using namespace Iridium::SPIRV;
@@ -121,6 +226,11 @@ static Iridium::SPIRV::ResultID llvmTypeToSPIRVType(Iridium::SPIRV::Builder& bui
 		} break;
 
 		case LLVMPointerTypeKind: {
+			if (isOpaquePointerType(llvmType)) {
+				// the pointee isn't part of the type; translate the pointer value with llvmValueTypeToSPIRVType() instead
+				throw std::runtime_error("Opaque pointer types can only be translated together with their value");
+			}
+
 			StorageClass storageClass = StorageClass::Output;
 			// TODO: somehow determine the appropriate storage class
 			//auto addrSpace = DynamicLLVM::LLVMGetPointerAddressSpace(llvmType);
@@ -144,6 +254,68 @@ static Iridium::SPIRV::ResultID llvmTypeToSPIRVType(Iridium::SPIRV::Builder& bui
 		default:
 			throw ImpossibleResultID();
 	}
+};
+
+// The SPIR-V type of an LLVM value. Unlike llvmTypeToSPIRVType(), this also works for pointer-typed values when
+// pointers are opaque. Pointers get a placeholder storage class; callers adjust it as needed.
+static Iridium::SPIRV::ResultID llvmValueTypeToSPIRVType(Iridium::SPIRV::Builder& builder, LLVMValueRef llvmValue) {
+	using namespace Iridium::SPIRV;
+
+	auto llvmType = DynamicLLVM::LLVMTypeOf(llvmValue);
+
+	if (DynamicLLVM::LLVMGetTypeKind(llvmType) != LLVMPointerTypeKind) {
+		return llvmTypeToSPIRVType(builder, llvmType);
+	}
+
+	return builder.declareType(Type(Type::PointerTag {}, StorageClass::Output, llvmTypeToSPIRVType(builder, pointeeTypeOf(llvmValue)), 8));
+};
+
+// Opaque pointers let loads, stores, and GEPs treat a pointer as pointing to whatever they need (e.g. the first
+// member of the structure it was declared to point to), but SPIR-V needs the pointee type to match. This gives
+// a pointer the requested pointee type, keeping its storage class.
+static Iridium::SPIRV::ResultID castPointerTo(Iridium::SPIRV::Builder& builder, Iridium::SPIRV::ResultID ptr, Iridium::SPIRV::ResultID pointeeType) {
+	using namespace Iridium::SPIRV;
+
+	auto ptrType = *builder.reverseLookupType(builder.lookupResultType(ptr));
+
+	if (ptrType.targetType == pointeeType) {
+		return ptr;
+	}
+
+	auto castTypeInst = ptrType;
+	castTypeInst.targetType = pointeeType;
+	auto castType = builder.declareType(castTypeInst);
+
+	if (ptrType.pointerStorageClass != StorageClass::PhysicalStorageBuffer) {
+		// logical pointers can't be bitcast, but a pointer to an aggregate whose first member (at any depth)
+		// has the requested type can be turned into a pointer to that member
+		std::vector<ResultID> indices;
+		ResultID currentID = ptrType.targetType;
+
+		while (currentID != pointeeType) {
+			auto current = *builder.reverseLookupType(currentID);
+
+			if (current.backingType == Type::BackingType::Structure && !current.structureMembers.empty()) {
+				currentID = current.structureMembers[0].id;
+			} else if (current.backingType == Type::BackingType::Array || current.backingType == Type::BackingType::Vector || current.backingType == Type::BackingType::Matrix) {
+				currentID = current.targetType;
+			} else {
+				break;
+			}
+
+			indices.push_back(builder.declareConstantScalar<int32_t>(0));
+		}
+
+		if (currentID == pointeeType) {
+			auto result = builder.encodeAccessChain(castType, ptr, indices);
+			builder.setResultType(result, castType);
+			return result;
+		}
+	}
+
+	auto result = builder.encodeBitcast(castType, ptr);
+	builder.setResultType(result, castType);
+	return result;
 };
 
 static std::string_view llvmMDStringToStringView(LLVMValueRef llvmMDString) {
@@ -250,7 +422,16 @@ static Iridium::SPIRV::ResultID llvmValueToResultID(Iridium::SPIRV::Builder& bui
 					}
 #endif
 
-					return builder.encodeBitcast(llvmTypeToSPIRVType(builder, type), targetID);
+					auto resultType = llvmValueTypeToSPIRVType(builder, llvmValue);
+					auto resultTypeInst = *builder.reverseLookupType(resultType);
+
+					if (resultTypeInst.backingType == Type::BackingType::Pointer && targetTypeInst.backingType == Type::BackingType::Pointer) {
+						// casting a pointer doesn't change where it points
+						resultTypeInst.pointerStorageClass = targetTypeInst.pointerStorageClass;
+						resultType = builder.declareType(resultTypeInst);
+					}
+
+					return builder.encodeBitcast(resultType, targetID);
 				} break;
 
 				default:
@@ -425,7 +606,8 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
 	// if the function returns a structure, we need to separate the components
 	// into separate output variables.
 
-	auto llfuncType = DynamicLLVM::LLVMGetElementType(DynamicLLVM::LLVMTypeOf(_function));
+	// (works with both typed and opaque pointers, unlike taking the element type of the function's pointer type)
+	auto llfuncType = DynamicLLVM::LLVMGlobalGetValueType(_function);
 	auto funcRetType = DynamicLLVM::LLVMGetReturnType(llfuncType);
 	std::vector<LLVMTypeRef> funcParamTypes(DynamicLLVM::LLVMCountParamTypes(llfuncType));
 	DynamicLLVM::LLVMGetParamTypes(llfuncType, funcParamTypes.data());
@@ -519,7 +701,7 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
 			auto kind = llvmMDStringToStringView(parameterInfo[1]);
 
 			if (kind == "air.buffer") {
-				auto type = llvmTypeToSPIRVType(builder, DynamicLLVM::LLVMGetElementType(funcParamTypes[i]));
+				auto type = llvmTypeToSPIRVType(builder, pointeeTypeOf(DynamicLLVM::LLVMGetParam(_function, i)));
 				auto addrPtrTypeInst = SPIRV::Type(SPIRV::Type::PointerTag {}, SPIRV::StorageClass::PhysicalStorageBuffer, type, 8);
 				auto addrPtrType = builder.declareType(addrPtrTypeInst);
 				bufferMembers.push_back(SPIRV::Type::Member { addrPtrType, 8 * bufferIndex, {} });
@@ -1050,7 +1232,6 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
 
 				case LLVMGetElementPtr: {
 					auto base = DynamicLLVM::LLVMGetOperand(inst, 0);
-					auto targetType = DynamicLLVM::LLVMTypeOf(inst);
 
 					std::vector<SPIRV::ResultID> indices;
 					auto operandCount = DynamicLLVM::LLVMGetNumOperands(inst);
@@ -1060,8 +1241,10 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
 						indices.push_back(llvmValueToResultID(builder, llindex));
 					}
 
-					auto tmp = llvmTypeToSPIRVType(builder, targetType);
-					auto tmp2 = llvmValueToResultID(builder, base);
+					auto tmp = llvmValueTypeToSPIRVType(builder, inst);
+					// with opaque pointers, the base may have been typed after a different use; view it as pointing to
+					// the GEP's source element type, which is also the element size the first index steps over
+					auto tmp2 = castPointerTo(builder, llvmValueToResultID(builder, base), llvmTypeToSPIRVType(builder, DynamicLLVM::LLVMGetGEPSourceElementType(inst)));
 
 					// ensure the resulting pointer storage class is the same as the input pointer storage class
 					auto type = *builder.reverseLookupType(tmp);
@@ -1098,8 +1281,7 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
 				case LLVMLoad: {
 					auto alignment = DynamicLLVM::LLVMGetAlignment(inst);
 					auto ptr = DynamicLLVM::LLVMGetOperand(inst, 0);
-					auto targetType = DynamicLLVM::LLVMTypeOf(inst);
-					auto type = llvmTypeToSPIRVType(builder, targetType);
+					auto type = llvmValueTypeToSPIRVType(builder, inst);
 					auto op = llvmValueToResultID(builder, ptr);
 					auto opType = *builder.reverseLookupType(builder.lookupResultType(op));
 					auto opDerefType = *builder.reverseLookupType(opType.targetType);
@@ -1112,6 +1294,8 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
 						op = access;
 					}
 
+					op = castPointerTo(builder, op, type);
+
 					auto resID = builder.encodeLoad(type, op, alignment);
 
 					builder.associateExistingResultID(resID, reinterpret_cast<uintptr_t>(inst));
@@ -1123,7 +1307,7 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
 					auto llval = DynamicLLVM::LLVMGetOperand(inst, 0);
 					auto llptr = DynamicLLVM::LLVMGetOperand(inst, 1);
 					auto val = llvmValueToResultID(builder, llval);
-					auto ptr = llvmValueToResultID(builder, llptr);
+					auto ptr = castPointerTo(builder, llvmValueToResultID(builder, llptr), llvmValueTypeToSPIRVType(builder, llval));
 
 					// TODO: also handle runtime arrays properly here
 
@@ -1132,7 +1316,6 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
 
 				case LLVMCall: {
 					auto target = DynamicLLVM::LLVMGetCalledValue(inst);
-					auto targetType = DynamicLLVM::LLVMTypeOf(inst);
 
 					size_t len = 0;
 					auto rawName = DynamicLLVM::LLVMGetValueName2(target, &len);
@@ -1143,7 +1326,7 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
 					}
 
 					SPIRV::ResultID resID = SPIRV::ResultIDInvalid;
-					auto type = llvmTypeToSPIRVType(builder, targetType);
+					auto type = llvmValueTypeToSPIRVType(builder, inst);
 
 					if (name == "air.convert.f.v2f32.u.v2i32") {
 						auto arg = DynamicLLVM::LLVMGetOperand(inst, 0);
@@ -1418,8 +1601,7 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
 				} break;
 
 				case LLVMPHI: {
-					auto lltype = DynamicLLVM::LLVMTypeOf(inst);
-					auto type = llvmTypeToSPIRVType(builder, lltype);
+					auto type = llvmValueTypeToSPIRVType(builder, inst);
 
 					std::vector<std::pair<SPIRV::ResultID, SPIRV::ResultID>> variablesAndBlocks;
 
@@ -1438,8 +1620,7 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
 
 				case LLVMBitCast: {
 					auto arg = DynamicLLVM::LLVMGetOperand(inst, 0);
-					auto lltype = DynamicLLVM::LLVMTypeOf(inst);
-					auto type = llvmTypeToSPIRVType(builder, lltype);
+					auto type = llvmValueTypeToSPIRVType(builder, inst);
 					auto argID = llvmValueToResultID(builder, arg);
 
 					// ensure the resulting pointer storage class is the same as the input pointer storage class
