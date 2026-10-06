@@ -521,6 +521,15 @@ void Indium::PrivateRenderCommandEncoder::drawIndexedPrimitives(PrimitiveType pr
 void Indium::PrivateRenderCommandEncoder::setDepthStencilState(std::shared_ptr<DepthStencilState> state) {
 	auto buf = _privateCommandBuffer.lock();
 	auto privateState = std::dynamic_pointer_cast<PrivateDepthStencilState>(state);
+
+	if (!privateState) {
+		// like Metal, no state means the defaults: no depth or stencil testing
+		DynamicVK::vkCmdSetDepthTestEnable(buf->commandBuffer(), VK_FALSE);
+		DynamicVK::vkCmdSetDepthWriteEnable(buf->commandBuffer(), VK_FALSE);
+		DynamicVK::vkCmdSetStencilTestEnable(buf->commandBuffer(), VK_FALSE);
+		return;
+	}
+
 	auto& desc = privateState->descriptor();
 
 	DynamicVK::vkCmdSetDepthWriteEnable(buf->commandBuffer(), desc.depthWriteEnabled ? VK_TRUE : VK_FALSE);
