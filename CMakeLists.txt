@@ -158,14 +158,27 @@ if (NOT DARLING)
 	)
 endif()
 
+# use the llvm-config that belongs to the LLVM found above, not whichever one comes first on PATH
+find_program(IRIDIUM_LLVM_CONFIG llvm-config HINTS "${LLVM_TOOLS_BINARY_DIR}" NO_DEFAULT_PATH)
+if (NOT IRIDIUM_LLVM_CONFIG)
+	set(IRIDIUM_LLVM_CONFIG llvm-config)
+endif()
+
 execute_process(
-	COMMAND llvm-config --link-shared --libnames
+	COMMAND "${IRIDIUM_LLVM_CONFIG}" --link-shared --libnames
 	OUTPUT_VARIABLE HOST_LLVM_LIBNAME
 	OUTPUT_STRIP_TRAILING_WHITESPACE
 )
 
+# The library Iridium dlopen()s at runtime. A bare soname is resolved by the host's dynamic
+# loader; set a full path to use an LLVM that lives outside the default search path.
+set(IRIDIUM_HOST_LLVM_LIBRARY "" CACHE STRING "LLVM shared library that Iridium loads at runtime (default: soname from llvm-config)")
+if (NOT IRIDIUM_HOST_LLVM_LIBRARY)
+	set(IRIDIUM_HOST_LLVM_LIBRARY "${HOST_LLVM_LIBNAME}")
+endif()
+
 target_compile_definitions(iridium PRIVATE
-	"HOST_LLVM_LIBNAME=\"${HOST_LLVM_LIBNAME}\""
+	"HOST_LLVM_LIBNAME=\"${IRIDIUM_HOST_LLVM_LIBRARY}\""
 )
 
 if (DARLING)
