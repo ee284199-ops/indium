@@ -66,6 +66,7 @@ namespace Indium {
 		virtual std::shared_ptr<ComputePipelineState> newComputePipelineState(std::shared_ptr<Function> computeFunction, PipelineOption options = PipelineOption::None, std::shared_ptr<ComputePipelineReflection> reflection = nullptr) override;
 		virtual std::shared_ptr<Buffer> newBuffer(size_t length, ResourceOptions options) override;
 		virtual std::shared_ptr<Buffer> newBuffer(const void* pointer, size_t length, ResourceOptions options) override;
+		virtual std::shared_ptr<Buffer> newBufferNoCopy(void* pointer, size_t length, ResourceOptions options, std::function<void()> deallocator) override;
 		virtual std::shared_ptr<Library> newLibrary(const void* data, size_t length) override;
 		virtual std::shared_ptr<Texture> newTexture(const TextureDescriptor& descriptor) override;
 		virtual std::shared_ptr<SamplerState> newSamplerState(const SamplerDescriptor& descriptor) override;
@@ -111,6 +112,7 @@ namespace Indium {
 		INDIUM_PROPERTY(VkCommandPool, o,O,neshotCommandPool) = VK_NULL_HANDLE;
 
 		INDIUM_PROPERTY(VkPhysicalDeviceMemoryProperties, m, M,emoryProperties);
+		INDIUM_PROPERTY(VkDeviceSize, m, M,inImportedHostPointerAlignment) = 0;
 		INDIUM_PROPERTY_READONLY(Feature, f, F,eatures);
 	};
 };

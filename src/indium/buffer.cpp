@@ -3,6 +3,7 @@
 #include <indium/dynamic-vk.hpp>
 
 #include <cstring>
+#include <utility>
 
 // TODO: use the VulkanMemoryAllocator library to manage memory allocation efficiently
 
@@ -113,6 +114,131 @@ Indium::PrivateBuffer::PrivateBuffer(std::shared_ptr<PrivateDevice> device, cons
 	}
 };
 
+// used by importHostMemory() for buffers that wrap caller-owned host memory;
+// does no Vulkan work of its own
+Indium::PrivateBuffer::PrivateBuffer(std::shared_ptr<PrivateDevice> device, size_t length, StorageMode storageMode, void* hostPointer):
+	_privateDevice(device),
+	_length(length),
+	_storageMode(storageMode),
+	_hostPointer(hostPointer)
+{};
+
+std::shared_ptr<Indium::PrivateBuffer> Indium::PrivateBuffer::importHostMemory(std::shared_ptr<PrivateDevice> device, void* pointer, size_t length, ResourceOptions options, std::function<void()> deallocator) {
+	auto buffer = std::shared_ptr<PrivateBuffer>(new PrivateBuffer(device, length, static_cast<StorageMode>((static_cast<size_t>(options) >> 4) & 0xf), pointer));
+
+	VkMemoryHostPointerPropertiesEXT hostPointerProps {};
+	hostPointerProps.sType = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT;
+
+	if (DynamicVK::vkGetMemoryHostPointerPropertiesEXT(device->device(), VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, pointer, &hostPointerProps) != VK_SUCCESS) {
+		return nullptr;
+	}
+
+	VkExternalMemoryBufferCreateInfo externalInfo {};
+	externalInfo.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO;
+	externalInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+
+	VkBufferCreateInfo info {};
+	info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+	info.pNext = &externalInfo;
+	info.size = length;
+	info.usage =
+		VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+		VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+		VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT |
+		VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT |
+		VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
+		VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+		VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+		VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
+		VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
+		VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT
+		;
+
+	info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+	if (DynamicVK::vkCreateBuffer(device->device(), &info, nullptr, &buffer->_buffer) != VK_SUCCESS) {
+		// ~PrivateBuffer has nothing to clean up yet
+		return nullptr;
+	}
+
+	VkMemoryRequirements requirements;
+
+	DynamicVK::vkGetBufferMemoryRequirements(device->device(), buffer->_buffer, &requirements);
+
+	uint32_t compatibleTypeBits = hostPointerProps.memoryTypeBits & requirements.memoryTypeBits;
+
+	size_t targetIndex = SIZE_MAX;
+	size_t coherentIndex = SIZE_MAX;
+
+	for (size_t i = 0; i < device->memoryProperties().memoryTypeCount; ++i) {
+		const auto& type = device->memoryProperties().memoryTypes[i];
+
+		if ((compatibleTypeBits & (1 << i)) == 0) {
+			continue;
+		}
+
+		if ((type.propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) == 0) {
+			continue;
+		}
+
+		if ((type.propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0 && coherentIndex == SIZE_MAX) {
+			// prefer host-coherent memory types so that no explicit flushing is needed
+			coherentIndex = i;
+		}
+
+		if (targetIndex == SIZE_MAX) {
+			// first compatible type; used if none of them are host-coherent
+			targetIndex = i;
+		}
+	}
+
+	if (coherentIndex != SIZE_MAX) {
+		targetIndex = coherentIndex;
+	}
+
+	if (targetIndex == SIZE_MAX) {
+		// no compatible host-visible memory type
+		return nullptr;
+	}
+
+	if (requirements.size > length) {
+		// the buffer needs more memory than the caller offered to wrap
+		return nullptr;
+	}
+
+	VkMemoryAllocateFlagsInfo allocateFlags {};
+	allocateFlags.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO;
+	allocateFlags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+
+	VkImportMemoryHostPointerInfoEXT importInfo {};
+	importInfo.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT;
+	importInfo.pNext = &allocateFlags;
+	importInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+	importInfo.pHostPointer = pointer;
+
+	VkMemoryAllocateInfo allocateInfo {};
+	allocateInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+	allocateInfo.pNext = &importInfo;
+	allocateInfo.allocationSize = length;
+	allocateInfo.memoryTypeIndex = targetIndex;
+
+	if (DynamicVK::vkAllocateMemory(device->device(), &allocateInfo, nullptr, &buffer->_memory) != VK_SUCCESS) {
+		// ~PrivateBuffer destroys the buffer and no-ops the free for the null memory handle
+		return nullptr;
+	}
+
+	if (DynamicVK::vkBindBufferMemory(device->device(), buffer->_buffer, buffer->_memory, 0) != VK_SUCCESS) {
+		// ~PrivateBuffer destroys the buffer and frees the memory
+		return nullptr;
+	}
+
+	buffer->_hostPointerCoherent = (device->memoryProperties().memoryTypes[targetIndex].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
+
+	buffer->_deallocator = std::move(deallocator);
+
+	return buffer;
+};
+
 Indium::PrivateBuffer::~PrivateBuffer() {
 	if (_mapped) {
 		DynamicVK::vkUnmapMemory(_privateDevice->device(), _memory);
@@ -120,6 +246,13 @@ Indium::PrivateBuffer::~PrivateBuffer() {
 
 	DynamicVK::vkDestroyBuffer(_privateDevice->device(), _buffer, nullptr);
 	DynamicVK::vkFreeMemory(_privateDevice->device(), _memory, nullptr);
+
+	if (_deallocator) {
+		// for buffers wrapping imported host memory, this releases the host memory;
+		// command buffers may keep the PrivateBuffer alive after the MTLBuffer is
+		// gone, so it must only run once Vulkan has fully let go of the memory.
+		_deallocator();
+	}
 };
 
 std::shared_ptr<Indium::Device> Indium::PrivateBuffer::device() {
@@ -135,6 +268,12 @@ void* Indium::PrivateBuffer::contents() {
 		return nullptr;
 	}
 
+	if (_hostPointer) {
+		// imported host memory is implicitly mapped at the host pointer;
+		// the Vulkan memory object behind it must not be mapped again
+		return _hostPointer;
+	}
+
 	if (!_mapped) {
 		if (DynamicVK::vkMapMemory(_privateDevice->device(), _memory, 0, VK_WHOLE_SIZE, 0, &_mapped) != VK_SUCCESS) {
 			// TODO
@@ -146,6 +285,11 @@ void* Indium::PrivateBuffer::contents() {
 };
 
 void Indium::PrivateBuffer::didModifyRange(Range<size_t> range) {
+	if (_hostPointer && _hostPointerCoherent) {
+		// imported memory from a host-coherent memory type is kept in sync automatically
+		return;
+	}
+
 	VkMappedMemoryRange vulkanRange {};
 	vulkanRange.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
 	vulkanRange.memory = _memory;

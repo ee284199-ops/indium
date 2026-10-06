@@ -222,6 +222,7 @@ Indium::PrivateDevice::PrivateDevice(VkPhysicalDevice physicalDevice):
 		{ VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME, Feature::ExternalMemoryFD },
 		{ VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME, Feature::ExternalSemaphoreFD },
 		{ VK_KHR_SHADER_NON_SEMANTIC_INFO_EXTENSION_NAME, Feature::NonSemanticInfo },
+		{ VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME, Feature::ExternalMemoryHost },
 	};
 
 	for (const auto& prop: extProps) {
@@ -246,6 +247,19 @@ Indium::PrivateDevice::PrivateDevice(VkPhysicalDevice physicalDevice):
 	}
 
 	_features = indiumFeatures;
+
+	if (!!(_features & Feature::ExternalMemoryHost)) {
+		VkPhysicalDeviceExternalMemoryHostPropertiesEXT hostProps {};
+		hostProps.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT;
+
+		VkPhysicalDeviceProperties2 props2 {};
+		props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+		props2.pNext = &hostProps;
+
+		DynamicVK::vkGetPhysicalDeviceProperties2(_physicalDevice, &props2);
+
+		_minImportedHostPointerAlignment = hostProps.minImportedHostPointerAlignment;
+	}
 
 	for (const auto& index: queueFamilyIndices) {
 		VkQueue queue;
@@ -333,6 +347,38 @@ std::shared_ptr<Indium::Buffer> Indium::PrivateDevice::newBuffer(size_t length, 
 
 std::shared_ptr<Indium::Buffer> Indium::PrivateDevice::newBuffer(const void* pointer, size_t length, ResourceOptions options) {
 	return std::make_shared<PrivateBuffer>(shared_from_this(), pointer, length, options);
+};
+
+std::shared_ptr<Indium::Buffer> Indium::PrivateDevice::newBufferNoCopy(void* pointer, size_t length, ResourceOptions options, std::function<void()> deallocator) {
+	if (!(_features & Feature::ExternalMemoryHost)) {
+		// the device doesn't support importing host memory
+		return nullptr;
+	}
+
+	auto storageMode = static_cast<StorageMode>((static_cast<size_t>(options) >> 4) & 0xf);
+
+	if (storageMode != StorageMode::Shared && storageMode != StorageMode::Managed) {
+		// Private and Memoryless buffers can't be mapped into the host
+		return nullptr;
+	}
+
+	if (pointer == nullptr || length == 0) {
+		return nullptr;
+	}
+
+	if (_minImportedHostPointerAlignment == 0) {
+		return nullptr;
+	}
+
+	if (reinterpret_cast<uintptr_t>(pointer) % _minImportedHostPointerAlignment != 0) {
+		return nullptr;
+	}
+
+	if (length % _minImportedHostPointerAlignment != 0) {
+		return nullptr;
+	}
+
+	return PrivateBuffer::importHostMemory(shared_from_this(), pointer, length, options, std::move(deallocator));
 };
 
 std::shared_ptr<Indium::Library> Indium::PrivateDevice::newLibrary(const void* data, size_t length) {

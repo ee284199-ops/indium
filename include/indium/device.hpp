@@ -2,6 +2,7 @@
 
 #include <string>
 #include <memory>
+#include <functional>
 
 #include <indium/init.hpp>
 #include <indium/base.hpp>
@@ -36,6 +37,23 @@ namespace Indium {
 		virtual std::shared_ptr<ComputePipelineState> newComputePipelineState(std::shared_ptr<Function> computeFunction, PipelineOption options = PipelineOption::None, std::shared_ptr<ComputePipelineReflection> reflection = nullptr) = 0;
 		virtual std::shared_ptr<Buffer> newBuffer(size_t length, ResourceOptions options) = 0;
 		virtual std::shared_ptr<Buffer> newBuffer(const void* pointer, size_t length, ResourceOptions options) = 0;
+		/**
+		 * Attempts to wrap caller-owned host memory in a Buffer without copying it.
+		 *
+		 * @param pointer     the host memory to wrap; must be aligned to the device's minimum
+		 *                    imported host pointer alignment.
+		 * @param length      the length of the host memory to wrap; must be aligned to the device's
+		 *                    minimum imported host pointer alignment.
+		 * @param options     resource options; only Shared and Managed storage modes are supported.
+		 * @param deallocator called once the returned Buffer (and its Vulkan memory) has been
+		 *                    destroyed; must not release the host memory before that.
+		 *
+		 * @return the wrapped Buffer, or nullptr if the memory can't be wrapped (e.g. the device
+		 *         doesn't support importing host memory, the pointer/length isn't suitably aligned,
+		 *         or no compatible memory type exists). The deallocator is NOT invoked if nullptr
+		 *         is returned.
+		 */
+		virtual std::shared_ptr<Buffer> newBufferNoCopy(void* pointer, size_t length, ResourceOptions options, std::function<void()> deallocator) = 0;
 		virtual std::shared_ptr<Library> newLibrary(const void* data, size_t length) = 0;
 		virtual std::shared_ptr<Texture> newTexture(const TextureDescriptor& descriptor) = 0;
 		virtual std::shared_ptr<SamplerState> newSamplerState(const SamplerDescriptor& descriptor) = 0;
