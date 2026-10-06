@@ -159,8 +159,10 @@ if (NOT DARLING)
 endif()
 
 # use the llvm-config that belongs to the LLVM found above, not whichever one comes first on PATH
-find_program(IRIDIUM_LLVM_CONFIG llvm-config HINTS "${LLVM_TOOLS_BINARY_DIR}" NO_DEFAULT_PATH)
-if (NOT IRIDIUM_LLVM_CONFIG)
+# (deliberately not cached, so that it follows LLVM_DIR when that changes)
+if (EXISTS "${LLVM_TOOLS_BINARY_DIR}/llvm-config")
+	set(IRIDIUM_LLVM_CONFIG "${LLVM_TOOLS_BINARY_DIR}/llvm-config")
+else()
 	set(IRIDIUM_LLVM_CONFIG llvm-config)
 endif()
 
