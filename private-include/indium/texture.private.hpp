@@ -27,6 +27,19 @@ namespace Indium {
 		std::shared_ptr<BinarySemaphore> _presentationSemaphore;
 		std::shared_ptr<PrivateDevice> _device;
 
+		/**
+		 * Copies a region of the texture's backing image out into CPU-accessible memory.
+		 *
+		 * This is the shared implementation of the `getBytes` virtuals. It works off of
+		 * the virtual `image()`, `imageLayout()` and `pixelFormat()` accessors, so any
+		 * subclass whose image can be transitioned to and from TRANSFER_SRC_OPTIMAL can
+		 * use it. The destination is written one row at a time.
+		 *
+		 * @param bytesPerImage If zero, the region's slices are assumed to be tightly
+		 *                      packed at `region.size.height * bytesPerRow` bytes each.
+		 */
+		void copyBytesFromImage(void* bytes, size_t bytesPerRow, size_t bytesPerImage, Region region, size_t mipmapLevel, size_t slice);
+
 	public:
 		explicit PrivateTexture(std::shared_ptr<PrivateDevice> device);
 		virtual ~PrivateTexture() = 0;
@@ -137,6 +150,9 @@ namespace Indium {
 		virtual void replaceRegion(Indium::Region region, size_t mipmapLevel, const void* bytes, size_t bytesPerRow) override;
 		virtual void replaceRegion(Indium::Region region, size_t mipmapLevel, size_t slice, const void* bytes, size_t bytesPerRow, size_t bytesPerImage) override;
 
+		virtual void getBytes(void* bytes, size_t bytesPerRow, Region region, size_t mipmapLevel) override;
+		virtual void getBytes(void* bytes, size_t bytesPerRow, size_t bytesPerImage, Region region, size_t mipmapLevel, size_t slice) override;
+
 		virtual void precommit(std::shared_ptr<Indium::PrivateCommandBuffer> cmdbuf) override;
 		virtual bool needsExportablePresentationSemaphore() const override;
 	};
@@ -175,5 +191,8 @@ namespace Indium {
 
 		virtual void replaceRegion(Indium::Region region, size_t mipmapLevel, const void* bytes, size_t bytesPerRow) override;
 		virtual void replaceRegion(Indium::Region region, size_t mipmapLevel, size_t slice, const void* bytes, size_t bytesPerRow, size_t bytesPerImage) override;
+
+		virtual void getBytes(void* bytes, size_t bytesPerRow, Region region, size_t mipmapLevel) override;
+		virtual void getBytes(void* bytes, size_t bytesPerRow, size_t bytesPerImage, Region region, size_t mipmapLevel, size_t slice) override;
 	};
 };

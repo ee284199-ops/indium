@@ -155,6 +155,7 @@ namespace Indium {
 			_macro(vkGetBufferMemoryRequirements) \
 			_macro(vkGetDeviceQueue) \
 			_macro(vkGetImageMemoryRequirements) \
+			_macro(vkGetMemoryHostPointerPropertiesEXT) \
 			_macro(vkGetPhysicalDeviceFeatures2) \
 			_macro(vkGetPhysicalDeviceMemoryProperties) \
 			_macro(vkGetPhysicalDeviceProperties) \

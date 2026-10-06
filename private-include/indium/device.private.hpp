@@ -44,6 +44,7 @@ namespace Indium {
 			ExternalMemoryFD    = 1 << 1,
 			ExternalSemaphoreFD = 1 << 2,
 			NonSemanticInfo     = 1 << 3,
+			ExternalMemoryHost  = 1 << 4,
 		};
 
 		friend inline Feature operator|(Feature lhs, Feature rhs) {

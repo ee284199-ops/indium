@@ -87,5 +87,8 @@ namespace Indium {
 
 		virtual void replaceRegion(Region region, size_t mipmapLevel, const void* bytes, size_t bytesPerRow) = 0;
 		virtual void replaceRegion(Region region, size_t mipmapLevel, size_t slice, const void* bytes, size_t bytesPerRow, size_t bytesPerImage) = 0;
+
+		virtual void getBytes(void* bytes, size_t bytesPerRow, Region region, size_t mipmapLevel) = 0;
+		virtual void getBytes(void* bytes, size_t bytesPerRow, size_t bytesPerImage, Region region, size_t mipmapLevel, size_t slice) = 0;
 	};
 };
